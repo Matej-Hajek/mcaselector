@@ -49,6 +49,14 @@ public class OverlayPool {
 			new LinkedBlockingQueue<>(),
 			new NamedThreadFactory("overlayValuePool"));
 
+	// The overlay image contains a one chunk wide border holding the values of the
+	// neighbouring regions. Without it image smoothing has nothing to interpolate
+	// against at the edges of the image and clamps to the outermost value instead,
+	// which makes every region border look like a hard cut in the overlay.
+	public static final int PADDING = 1;
+	public static final int IMAGE_SIZE = Tile.SIZE_IN_CHUNKS + PADDING * 2;
+	private static final int CHUNK_MASK = Tile.SIZE_IN_CHUNKS - 1;
+
 	private Overlay parser;
 
 	private Point2i hoveredRegion;
@@ -98,7 +106,7 @@ public class OverlayPool {
 			}
 
 			if (data != null) {
-				Image overlay = parseColorGrades(data, parserClone.min(), parserClone.max(), parserClone.getMinHue(), parserClone.getMaxHue());
+				Image overlay = createOverlayImage(parserClone, tile.location, data);
 				if (parserClone.equals(this.parser)) {
 					tile.overlay = overlay;
 					tile.overlayLoaded = true;
@@ -117,8 +125,10 @@ public class OverlayPool {
 						}
 						if (parserClone.equals(this.parser)) {
 							push(tile.location, d);
-							tile.overlay = parseColorGrades(d, parser.min(), parser.max(), parser.getMinHue(), parser.getMaxHue());
+							tile.overlay = createOverlayImage(parserClone, tile.location, d);
 							tile.overlayLoaded = true;
+							// the neighbours were rendered without the data of this region
+							tileMap.invalidateOverlayBorders(tile.location);
 							tileMap.draw();
 						}
 					}
@@ -131,7 +141,7 @@ public class OverlayPool {
 		try {
 			int[] data = CacheHandler.getData(parser, location);
 			if (data != null) {
-				return parseColorGrades(data, parser.min(), parser.max(), parser.getMinHue(), parser.getMaxHue());
+				return createOverlayImage(parser, location, data);
 			}
 		} catch (Exception ex) {
 			LOGGER.warn("failed to load cached overlay data for region {}", location, ex);
@@ -146,7 +156,7 @@ public class OverlayPool {
 				region, poi, entities,
 				(i, u) -> {
 					if (i != null) {
-						image.set(parseColorGrades(i, parser.min(), parser.max(), parser.getMinHue(), parser.getMaxHue()));
+						image.set(createOverlayImage(parser, location, i));
 					}
 				},
 				parser,
@@ -155,16 +165,62 @@ public class OverlayPool {
 		return image.get();
 	}
 
-	private static Image parseColorGrades(int[] data, int min, int max, float minHue, float maxHue) {
-		int[] colors = new int[1024];
-		for (int i = 0; i < 1024; i++) {
-			colors[i] = getColorGrade(data[i], min, max, minHue, maxHue);
+	private Image createOverlayImage(Overlay parser, Point2i location, int[] data) {
+		int[][] regions = new int[9][];
+		for (int z = -1; z <= 1; z++) {
+			for (int x = -1; x <= 1; x++) {
+				regions[(z + 1) * 3 + x + 1] = x == 0 && z == 0 ? data : loadNeighbourData(parser, location.add(x, z));
+			}
+		}
+		return parseColorGrades(regions, parser.min(), parser.max(), parser.getMinHue(), parser.getMaxHue());
+	}
+
+	// only returns data that has already been parsed, null if the region is still
+	// unknown. in that case the border of the image falls back to the values of
+	// this region, which is what the image smoothing did before.
+	private int[] loadNeighbourData(Overlay parser, Point2i location) {
+		if (noData.contains(location)) {
+			return null;
+		}
+		try {
+			return CacheHandler.getData(parser, location);
+		} catch (Exception ex) {
+			LOGGER.debug("failed to load cached overlay data for neighbouring region {}", location, ex);
+			return null;
+		}
+	}
+
+	// regions holds the data of this region and its 8 neighbours, indexed by
+	// (regionZ + 1) * 3 + regionX + 1, where the center is this region
+	private static Image parseColorGrades(int[][] regions, int min, int max, float minHue, float maxHue) {
+		int[] colors = new int[IMAGE_SIZE * IMAGE_SIZE];
+		for (int z = 0; z < IMAGE_SIZE; z++) {
+			for (int x = 0; x < IMAGE_SIZE; x++) {
+				int value = valueAt(regions, x - PADDING, z - PADDING);
+				colors[z * IMAGE_SIZE + x] = getColorGrade(value, min, max, minHue, maxHue);
+			}
 		}
 
-		WritableImage image = new WritableImage(32, 32);
-		image.getPixelWriter().setPixels(0, 0, 32, 32, PixelFormat.getIntArgbPreInstance(), colors, 0, 32);
+		WritableImage image = new WritableImage(IMAGE_SIZE, IMAGE_SIZE);
+		image.getPixelWriter().setPixels(0, 0, IMAGE_SIZE, IMAGE_SIZE, PixelFormat.getIntArgbPreInstance(), colors, 0, IMAGE_SIZE);
 
 		return image;
+	}
+
+	// chunk coordinates are relative to this region and range from -1 to 32
+	private static int valueAt(int[][] regions, int chunkX, int chunkZ) {
+		int regionX = chunkX < 0 ? -1 : chunkX >= Tile.SIZE_IN_CHUNKS ? 1 : 0;
+		int regionZ = chunkZ < 0 ? -1 : chunkZ >= Tile.SIZE_IN_CHUNKS ? 1 : 0;
+		int[] data = regions[(regionZ + 1) * 3 + regionX + 1];
+		if (data != null) {
+			return data[(chunkZ & CHUNK_MASK) * Tile.SIZE_IN_CHUNKS + (chunkX & CHUNK_MASK)];
+		}
+		// no data for that neighbour, repeat the closest value of this region
+		return regions[4][clampToRegion(chunkZ) * Tile.SIZE_IN_CHUNKS + clampToRegion(chunkX)];
+	}
+
+	private static int clampToRegion(int chunkCoord) {
+		return Math.max(0, Math.min(chunkCoord, Tile.SIZE_IN_CHUNKS - 1));
 	}
 
 	private static int getColorGrade(int value, int min, int max, float minHue, float maxHue) {

@@ -104,9 +104,18 @@ public final class SelectionImageExporter {
 			if (overlayPool != null && overlayPool.getParser() != null) {
 				// load overlay image
 				overlay = overlayPool.getImage(getRegionDirectories().getLocation(), mcaFile, null, null);
-				// scale up
-				BufferedImage scaled = ImageHelper.scaleImage(SwingFXUtils.fromFXImage(overlay, null), 512, ConfigProvider.WORLD.getSmoothOverlays());
-				overlay = SwingFXUtils.toFXImage(scaled, null);
+				// the overlay image has a border with the values of the neighbouring
+				// regions, scale it up along with the region and cut it off again so
+				// that smoothing blends across the region border instead of clamping
+				int border = Tile.SIZE / Tile.SIZE_IN_CHUNKS * OverlayPool.PADDING;
+				BufferedImage scaled = ImageHelper.scaleImage(SwingFXUtils.fromFXImage(overlay, null), Tile.SIZE + border * 2, ConfigProvider.WORLD.getSmoothOverlays());
+				// copy the region out of the scaled image instead of using getSubimage,
+				// SwingFXUtils does not honour the offset of a sub image raster
+				BufferedImage cropped = new BufferedImage(Tile.SIZE, Tile.SIZE, BufferedImage.TYPE_INT_ARGB);
+				Graphics2D cropGraphics = cropped.createGraphics();
+				cropGraphics.drawImage(scaled, -border, -border, null);
+				cropGraphics.dispose();
+				overlay = SwingFXUtils.toFXImage(cropped, null);
 			}
 
 			PixelReader pixelReader;

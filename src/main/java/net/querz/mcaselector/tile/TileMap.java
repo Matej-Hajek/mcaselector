@@ -428,6 +428,24 @@ public class TileMap extends Canvas implements ClipboardOwner {
 		}
 	}
 
+	// The overlay image of a region contains a border with the values of its
+	// neighbours, so all neighbours of a region that has just been parsed have to be
+	// rendered again to pick that data up.
+	public void invalidateOverlayBorders(Point2i region) {
+		for (int z = -1; z <= 1; z++) {
+			for (int x = -1; x <= 1; x++) {
+				if (x == 0 && z == 0) {
+					continue;
+				}
+				Tile tile = tiles.get(region.add(x, z).asLong());
+				if (tile != null && tile.overlayLoaded) {
+					tile.overlay = null;
+					tile.overlayLoaded = false;
+				}
+			}
+		}
+	}
+
 	public Overlay getOverlay() {
 		return overlayParser.get();
 	}

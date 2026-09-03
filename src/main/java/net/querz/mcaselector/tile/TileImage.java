@@ -55,11 +55,7 @@ public final class TileImage {
 			}
 
 			if (overlay && tile.overlay != null) {
-				ctx.setGlobalAlpha(0.5);
-				ctx.setImageSmoothing(ConfigProvider.WORLD.getSmoothOverlays());
-				ctx.drawImage(tile.getOverlay(), offset.getX(), offset.getY(), Tile.SIZE / scale, Tile.SIZE / scale);
-				ctx.setGlobalAlpha(1);
-				ctx.setImageSmoothing(false);
+				drawOverlay(ctx, tile.getOverlay(), offset, scale);
 			}
 
 			if (selection.isRegionSelected(tile.getLongLocation())) {
@@ -76,6 +72,25 @@ public final class TileImage {
 			ctx.setFill(ConfigProvider.GLOBAL.getRegionSelectionColor().makeJavaFXColor());
 			ctx.fillRect(offset.getX(), offset.getY(), Tile.SIZE / scale, Tile.SIZE / scale);
 		}
+	}
+
+	// The overlay image is one chunk larger than the region on every side and that
+	// border holds the values of the neighbouring regions. It is drawn outside of
+	// the tile and clipped away again, so image smoothing has something to
+	// interpolate against instead of clamping to the edge of the image, which used
+	// to leave a hard seam along every region border.
+	private static void drawOverlay(GraphicsContext ctx, Image overlay, Point2f offset, float scale) {
+		double size = Tile.SIZE / scale;
+		double padding = size / Tile.SIZE_IN_CHUNKS * OverlayPool.PADDING;
+
+		ctx.save();
+		ctx.beginPath();
+		ctx.rect(offset.getX(), offset.getY(), size, size);
+		ctx.clip();
+		ctx.setGlobalAlpha(0.5);
+		ctx.setImageSmoothing(ConfigProvider.WORLD.getSmoothOverlays());
+		ctx.drawImage(overlay, offset.getX() - padding, offset.getY() - padding, size + padding * 2, size + padding * 2);
+		ctx.restore();
 	}
 
 	public static void drawStructures(GraphicsContext ctx, Tile tile, float scale, Point2f offset) {
