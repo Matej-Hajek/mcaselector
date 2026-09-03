@@ -8,6 +8,7 @@ import net.querz.mcaselector.config.ConfigProvider;
 import net.querz.mcaselector.io.FileHelper;
 import net.querz.mcaselector.io.JobHandler;
 import net.querz.mcaselector.io.NamedThreadFactory;
+import net.querz.mcaselector.io.RegionDirectories;
 import net.querz.mcaselector.io.db.CacheHandler;
 import net.querz.mcaselector.io.job.ParseDataJob;
 import net.querz.mcaselector.io.mca.EntitiesMCAFile;
@@ -21,8 +22,8 @@ import org.apache.logging.log4j.Logger;
 import org.iq80.leveldb.DBException;
 import java.awt.*;
 import java.io.IOException;
-import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -33,7 +34,11 @@ public class OverlayPool {
 	private static final Logger LOGGER = LogManager.getLogger(OverlayPool.class);
 
 	private final TileMap tileMap;
-	private final Set<Point2i> noData = new HashSet<>();
+	private final Set<Point2i> noData = ConcurrentHashMap.newKeySet();
+
+	// makes sure a region is only parsed once when several image exports need it as
+	// a neighbour at the same time
+	private final ConcurrentHashMap<Long, Object> parseLocks = new ConcurrentHashMap<>();
 
 	// used to load and render data asynchronously from db
 	private final ThreadPoolExecutor overlayCacheLoaders = new ThreadPoolExecutor(
@@ -106,7 +111,7 @@ public class OverlayPool {
 			}
 
 			if (data != null) {
-				Image overlay = createOverlayImage(parserClone, tile.location, data);
+				Image overlay = createOverlayImage(parserClone, tile.location, data, false);
 				if (parserClone.equals(this.parser)) {
 					tile.overlay = overlay;
 					tile.overlayLoaded = true;
@@ -125,7 +130,7 @@ public class OverlayPool {
 						}
 						if (parserClone.equals(this.parser)) {
 							push(tile.location, d);
-							tile.overlay = createOverlayImage(parserClone, tile.location, d);
+							tile.overlay = createOverlayImage(parserClone, tile.location, d, false);
 							tile.overlayLoaded = true;
 							// the neighbours were rendered without the data of this region
 							tileMap.invalidateOverlayBorders(tile.location);
@@ -138,55 +143,90 @@ public class OverlayPool {
 	}
 
 	public Image getImage(Point2i location, RegionMCAFile region, PoiMCAFile poi, EntitiesMCAFile entities) {
-		try {
-			int[] data = CacheHandler.getData(parser, location);
-			if (data != null) {
-				return createOverlayImage(parser, location, data);
-			}
-		} catch (Exception ex) {
-			LOGGER.warn("failed to load cached overlay data for region {}", location, ex);
+		Overlay parser = this.parser;
+		int[] data = loadData(parser, location);
+		if (data == null) {
+			data = parseData(parser, location, region, poi, entities);
+		}
+		if (data == null) {
 			return null;
 		}
-
-		DataProperty<Image> image = new DataProperty<>();
-		new ParseDataJob(
-				new Tile(location),
-				ConfigProvider.WORLD.getWorldDirs().makeRegionDirectories(location),
-				ConfigProvider.WORLD.getWorldUUID(),
-				region, poi, entities,
-				(i, u) -> {
-					if (i != null) {
-						image.set(createOverlayImage(parser, location, i));
-					}
-				},
-				parser,
-				null
-		).execute();
-		return image.get();
+		// there is no tile map here that parses the surrounding regions in the
+		// background, so the neighbours needed for the border are parsed on demand
+		return createOverlayImage(parser, location, data, true);
 	}
 
-	private Image createOverlayImage(Overlay parser, Point2i location, int[] data) {
+	private Image createOverlayImage(Overlay parser, Point2i location, int[] data, boolean parseNeighbours) {
 		int[][] regions = new int[9][];
 		for (int z = -1; z <= 1; z++) {
 			for (int x = -1; x <= 1; x++) {
-				regions[(z + 1) * 3 + x + 1] = x == 0 && z == 0 ? data : loadNeighbourData(parser, location.add(x, z));
+				if (x == 0 && z == 0) {
+					regions[4] = data;
+					continue;
+				}
+				Point2i neighbour = location.add(x, z);
+				int[] neighbourData = loadData(parser, neighbour);
+				if (neighbourData == null && parseNeighbours) {
+					neighbourData = parseData(parser, neighbour, null, null, null);
+				}
+				regions[(z + 1) * 3 + x + 1] = neighbourData;
 			}
 		}
 		return parseColorGrades(regions, parser.min(), parser.max(), parser.getMinHue(), parser.getMaxHue());
 	}
 
 	// only returns data that has already been parsed, null if the region is still
-	// unknown. in that case the border of the image falls back to the values of
-	// this region, which is what the image smoothing did before.
-	private int[] loadNeighbourData(Overlay parser, Point2i location) {
+	// unknown. a neighbour without data makes the border of the image fall back to
+	// the values of this region, which is what the image smoothing did before.
+	private int[] loadData(Overlay parser, Point2i location) {
 		if (noData.contains(location)) {
 			return null;
 		}
 		try {
 			return CacheHandler.getData(parser, location);
 		} catch (Exception ex) {
-			LOGGER.debug("failed to load cached overlay data for neighbouring region {}", location, ex);
+			LOGGER.warn("failed to load cached overlay data for region {}", location, ex);
 			return null;
+		}
+	}
+
+	// parses a region and caches the result, so that the regions around it can use
+	// it for their border without parsing it again
+	private int[] parseData(Overlay parser, Point2i location, RegionMCAFile region, PoiMCAFile poi, EntitiesMCAFile entities) {
+		Object lock = parseLocks.computeIfAbsent(location.asLong(), k -> new Object());
+		try {
+			synchronized (lock) {
+				// another thread might have parsed this region in the meantime
+				int[] parsed = loadData(parser, location);
+				if (parsed != null) {
+					return parsed;
+				}
+
+				RegionDirectories dirs = ConfigProvider.WORLD.getWorldDirs().makeRegionDirectories(location);
+				DataProperty<int[]> data = new DataProperty<>();
+				new ParseDataJob(
+						new Tile(location),
+						dirs,
+						ConfigProvider.WORLD.getWorldUUID(),
+						region, poi, entities,
+						(d, u) -> data.set(d),
+						parser,
+						null
+				).execute();
+
+				if (data.get() == null) {
+					noData.add(location);
+					return null;
+				}
+				try {
+					CacheHandler.setData(parser, location, data.get());
+				} catch (Exception ex) {
+					LOGGER.warn("failed to cache overlay data for region {}", location, ex);
+				}
+				return data.get();
+			}
+		} finally {
+			parseLocks.remove(location.asLong(), lock);
 		}
 	}
 
